@@ -1,4 +1,4 @@
-Welcome to QuerySage – the next-generation document query engine powered by advanced language models!
+Welcome to **QuerySage** – the next-generation document query engine powered by advanced language models!
 
 Imagine having a digital library of all your essential documents, each paired with tailored questions and guidelines, and a smart assistant ready to provide precise answers in seconds. That’s exactly what this project does!
 
