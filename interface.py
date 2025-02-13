@@ -216,6 +216,322 @@ def execute_db_query(query: str, params: tuple = None, fetch: bool = False) -> A
         raise
 
 
+def create_answer_doc(answer: str, filename: str):
+    """Create a document with just the answer"""
+    doc = Document()
+    doc.add_heading('Generated Answer', 0)
+    doc.add_paragraph(answer)
+    doc.save(filename)
+
+def create_qa_doc(question: str, answer: str, filename: str):
+    """Create a document with both question and answer"""
+    doc = Document()
+    doc.add_heading('Question and Answer', 0)
+    
+    # Add question section
+    doc.add_heading('Question:', level=1)
+    doc.add_paragraph(question)
+    
+    # Add answer section
+    doc.add_heading('Answer:', level=1)
+    doc.add_paragraph(answer)
+    
+    doc.save(filename)
+
+def create_all_qa_doc(questions_and_answers: list, filename: str):
+    """Create a document with multiple questions and answers"""
+    doc = Document()
+    doc.add_heading('All Questions and Answers', 0)
+    
+    for idx, (question, answer) in enumerate(questions_and_answers, 1):
+        # Add section for each Q&A pair
+        doc.add_heading(f'Question {idx}:', level=1)
+        doc.add_paragraph(question)
+        
+        doc.add_heading('Answer:', level=2)
+        doc.add_paragraph(answer)
+        
+        # Add a page break after each Q&A except the last one
+        if idx < len(questions_and_answers):
+            doc.add_page_break()
+    
+    doc.save(filename)
+
+def generate_all_answers(subject_id: str, embeddings, llm) -> list:
+    """Generate answers for all questions in a subject"""
+    # Get all questions for the subject
+    questions = execute_db_query(
+        """SELECT q.*, s.vector_db_url as subject_vector_db_url 
+           FROM questions q 
+           JOIN subjects s ON q.subject_id = s.id 
+           WHERE q.subject_id = %s 
+           ORDER BY q.created_at""",
+        (subject_id,),
+        fetch=True
+    )
+    
+    qa_pairs = []
+    for q in questions:
+        logger.info(f"Generating answer for question: {q[1][:100]}...")
+        
+        # Initialize content list
+        retrieved_content = []
+        
+        # 1. Get subject-level information
+        subject_vector_store = LangchainPinecone.from_existing_index(
+            index_name=INDEX_NAME,
+            embedding=embeddings,
+            namespace=q[-1]  # subject_vector_db_url from join
+        )
+        
+        # Get subject content
+        subject_retriever = subject_vector_store.as_retriever(search_kwargs={"k": 5})
+        subject_docs = subject_retriever.get_relevant_documents(q[1])
+        retrieved_content.extend([doc.page_content for doc in subject_docs])
+        
+        # 2. Get question-specific guidelines
+        is_textbox = q[4]  # is_textbox
+        guideline_text = q[3]  # guideline_text_box
+        guideline_vector_db_url = q[2]  # guideline_vector_db_url
+        
+        if is_textbox and guideline_text:
+            retrieved_content.append(f"Question Guidelines:\n{guideline_text}")
+        elif not is_textbox and guideline_vector_db_url:
+            try:
+                question_vector_store = LangchainPinecone.from_existing_index(
+                    index_name=INDEX_NAME,
+                    embedding=embeddings,
+                    namespace=guideline_vector_db_url
+                )
+                guideline_retriever = question_vector_store.as_retriever(search_kwargs={"k": 3})
+                guideline_docs = guideline_retriever.get_relevant_documents(q[1])
+                retrieved_content.extend([doc.page_content for doc in guideline_docs])
+            except Exception as e:
+                logger.warning(f"Could not use question guidelines: {str(e)}")
+        
+        # Get additional context
+        additional_context = []
+        
+        # 3. Handle sample answers based on input type
+        if is_textbox:
+            sample_answers_text = q[7]  # sample_answers_textbox
+            if sample_answers_text:
+                additional_context.append(f"Sample Answers:\n{sample_answers_text}")
+        else:
+            sample_answers_vector_db_url = q[5]  # sample_answers_vector_db_url
+            if sample_answers_vector_db_url:
+                try:
+                    sample_answers_store = LangchainPinecone.from_existing_index(
+                        index_name=INDEX_NAME,
+                        embedding=embeddings,
+                        namespace=sample_answers_vector_db_url
+                    )
+                    sample_answers_retriever = sample_answers_store.as_retriever(search_kwargs={"k": 3})
+                    sample_answers_docs = sample_answers_retriever.get_relevant_documents(q[1])
+                    if sample_answers_docs:
+                        additional_context.append("Sample Answers:\n" + "\n".join([doc.page_content for doc in sample_answers_docs]))
+                except Exception as e:
+                    logger.warning(f"Could not use sample answers from vector store: {str(e)}")
+        
+        if q[6]:  # Instructions
+            additional_context.append(f"Instructions:\n{q[6]}")
+        
+        # Prepare prompt and generate answer
+        prompt = f"""Question: {q[1]}
+
+Retrieved Information:
+{'-' * 50}
+{'\n'.join(retrieved_content)}
+{'-' * 50}
+
+{'\n\n'.join(additional_context)}
+
+You are an expert in the subject of the question. Please provide a comprehensive answer to the question using the retrieved information above."""
+        
+        answer = llm.predict(prompt)
+        qa_pairs.append((q[1], answer))
+        logger.info("Answer generated successfully")
+    
+    return qa_pairs
+
+def delete_vector_store_namespace(namespace: str):
+    """Delete a namespace from the Pinecone vector store"""
+    try:
+        logger.info(f"Starting deletion of namespace '{namespace}' from vector store")
+        index.delete(namespace=namespace, delete_all=True)
+        logger.info(f"✓ Successfully deleted vector store namespace: '{namespace}'")
+    except Exception as e:
+        logger.error(f"❌ Failed to delete vector store namespace '{namespace}': {str(e)}")
+        raise
+
+def delete_question(question_id: str):
+    """Delete a question and its associated vector store data"""
+    try:
+        # Get question data before deletion
+        question = execute_db_query(
+            """SELECT id, text, guideline_vector_db_url, guideline_text_box, 
+                     is_textbox::boolean, sample_answers_vector_db_url, 
+                     sample_answers_textbox, instructions, created_at, subject_id 
+              FROM questions 
+              WHERE id = %s""",
+            (question_id,),
+            fetch=True
+        )[0]
+        
+        logger.info("\n=== Starting deletion of question ===")
+        logger.info(f"Question ID: {question_id}")
+        logger.info(f"Question Text: {question[1][:100]}...")
+        
+        # Debug log to show actual is_textbox value
+        logger.info(f"Raw is_textbox value from DB: {question[4]} (type: {type(question[4])})")
+        logger.info(f"Raw is_textbox value repr: {repr(question[4])}")
+        
+        # Properly check is_textbox value
+        is_textbox = bool(question[4])  # Convert to boolean to ensure proper type
+        logger.info(f"Converted is_textbox value: {is_textbox} (type: {type(is_textbox)})")
+        input_method = "Text Input" if is_textbox else "File Upload"
+        logger.info(f"Input Method: {input_method}")
+        
+        # Check for any vector stores to delete
+        vector_stores_deleted = False
+        
+        # For file upload questions (is_textbox = False), check and delete vector stores
+        if not is_textbox:  # Using the properly converted boolean value
+            logger.info("Question uses file upload - checking for vector stores")
+            
+            # Check and delete guideline vector store
+            if question[2]:  # guideline_vector_db_url
+                logger.info(f"Found guideline vector store to delete: {question[2]}")
+                try:
+                    delete_vector_store_namespace(question[2])
+                    logger.info("✓ Guidelines vector store deleted")
+                    vector_stores_deleted = True
+                except Exception as e:
+                    logger.error(f"Failed to delete guideline vector store: {str(e)}")
+            else:
+                logger.info("No guideline vector store found")
+            
+            # Check and delete sample answers vector store
+            if question[5]:  # sample_answers_vector_db_url
+                logger.info(f"Found sample answers vector store to delete: {question[5]}")
+                try:
+                    delete_vector_store_namespace(question[5])
+                    logger.info("✓ Sample answers vector store deleted")
+                    vector_stores_deleted = True
+                except Exception as e:
+                    logger.error(f"Failed to delete sample answers vector store: {str(e)}")
+            else:
+                logger.info("No sample answers vector store found")
+        else:
+            logger.info("Question uses text input - no vector stores to delete")
+        
+        if not vector_stores_deleted:
+            logger.info("No vector stores were deleted")
+        
+        # Delete from database
+        execute_db_query(
+            "DELETE FROM questions WHERE id = %s",
+            (question_id,)
+        )
+        logger.info("✓ Question record deleted from database")
+        logger.info("=== Question deletion completed ===\n")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error deleting question {question_id}: {str(e)}")
+        return False
+
+def delete_subject(subject_id: str):
+    """Delete a subject and all its questions"""
+    try:
+        # Get subject data before deletion
+        subject = execute_db_query(
+            "SELECT * FROM subjects WHERE id = %s",
+            (subject_id,),
+            fetch=True
+        )[0]
+        
+        logger.info(f"\n=== Starting deletion of subject ===")
+        logger.info(f"Subject ID: {subject_id}")
+        logger.info(f"Subject Name: {subject[1]}")
+        
+        # Get all questions for this subject
+        questions = execute_db_query(
+            "SELECT id FROM questions WHERE subject_id = %s",
+            (subject_id,),
+            fetch=True
+        )
+        
+        # Delete all questions first
+        logger.info(f"Found {len(questions)} questions to delete")
+        for i, question in enumerate(questions, 1):
+            logger.info(f"\nDeleting question {i} of {len(questions)}")
+            if delete_question(question[0]):
+                logger.info(f"✓ Successfully deleted question {i}")
+            else:
+                logger.warning(f"⚠️ Failed to delete question {i}")
+        
+        # Delete subject's vector store data if exists
+        if subject[3]:  # vector_db_url
+            logger.info(f"Found subject vector store to delete: {subject[3]}")
+            delete_vector_store_namespace(subject[3])
+            logger.info("✓ Subject vector store deleted")
+        else:
+            logger.info("No subject vector store to delete")
+        
+        # Delete from database
+        execute_db_query(
+            "DELETE FROM subjects WHERE id = %s",
+            (subject_id,)
+        )
+        logger.info("✓ Subject record deleted from database")
+        logger.info("=== Subject deletion completed ===\n")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error deleting subject {subject_id}: {str(e)}")
+        return False
+
+def delete_course(course_id: str):
+    """Delete a course and all its subjects"""
+    try:
+        # Get course data first
+        course = execute_db_query(
+            "SELECT * FROM courses WHERE id = %s",
+            (course_id,),
+            fetch=True
+        )[0]
+        
+        logger.info(f"\n=== Starting deletion of course ===")
+        logger.info(f"Course ID: {course_id}")
+        logger.info(f"Course Name: {course[1]}")
+        
+        # Get all subjects for this course
+        subjects = execute_db_query(
+            "SELECT id, name FROM subjects WHERE course_id = %s",
+            (course_id,),
+            fetch=True
+        )
+        
+        # Delete all subjects first
+        logger.info(f"Found {len(subjects)} subjects to delete")
+        for i, subject in enumerate(subjects, 1):
+            logger.info(f"\nDeleting subject {i} of {len(subjects)}: {subject[1]}")
+            if delete_subject(subject[0]):
+                logger.info(f"✓ Successfully deleted subject {i}")
+            else:
+                logger.warning(f"⚠️ Failed to delete subject {i}")
+        
+        # Delete from database
+        execute_db_query(
+            "DELETE FROM courses WHERE id = %s",
+            (course_id,)
+        )
+        logger.info("✓ Course record deleted from database")
+        logger.info("=== Course deletion completed ===\n")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error deleting course {course_id}: {str(e)}")
+        return False
+
 def main():
     st.set_page_config(page_title="RAG Course Assessment System", layout="wide")
 
@@ -272,13 +588,21 @@ def show_course_management():
     courses = cursor.fetchall()
     if courses:
         for course in courses:
-            col1, col2 = st.columns([2, 1])
+            col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
                 st.write(f"📚 {course[1]}")
             with col2:
                 if st.button("Select", key=f"select_course_{course[0]}"):
                     st.session_state.current_course = course[0]
                     st.success(f"Selected course: {course[1]}")
+            with col3:
+                if st.button("Delete", key=f"delete_course_{course[0]}"):
+                    if delete_course(course[0]):
+                        st.success(f"Course '{course[1]}' deleted successfully!")
+                        st.session_state.current_course = None
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to delete course '{course[1]}'")
     else:
         st.info("No courses created yet.")
 
@@ -349,13 +673,21 @@ def show_subject_management():
     logger.info(f"Retrieved {len(subjects)} subjects for course {st.session_state.current_course}")
     if subjects:
         for subject in subjects:
-            col1, col2 = st.columns([2, 1])
+            col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
                 st.write(f"📘 {subject[1]}")
             with col2:
                 if st.button("Select", key=f"select_subject_{subject[0]}"):
                     st.session_state.current_subject = subject[0]
                     st.success(f"Selected subject: {subject[1]}")
+            with col3:
+                if st.button("Delete", key=f"delete_subject_{subject[0]}"):
+                    if delete_subject(subject[0]):
+                        st.success(f"Subject '{subject[1]}' deleted successfully!")
+                        st.session_state.current_subject = None
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to delete subject '{subject[1]}'")
     else:
         st.info("No subjects created yet.")
 
@@ -367,81 +699,178 @@ def show_question_management():
         st.warning("Please select a subject first from Subject Management.")
         return
 
+    # Initialize the guideline input method in session state if not present
+    if "guideline_input_method" not in st.session_state:
+        st.session_state.guideline_input_method = "Upload Files"
+
+    # Add radio button outside the form for instant updates
+    selected_method = st.radio(
+        "How would you like to provide guidelines and sample answers?",
+        ["Upload Files", "Text Input"]
+    )
+    # Update session state and log the selection
+    st.session_state.guideline_input_method = selected_method
+    logger.info(f"Selected input method: {selected_method}")
+    
     # Create new question
     with st.form(key="question_form"):
         st.subheader("Add New Question")
         question_text = st.text_area("Question Text")
-        guideline_files = st.file_uploader(
-            "Upload Guideline Files",
-            accept_multiple_files=True,
-            type=["pdf", "docx", "txt"],
-        )
-        sample_answers_files = st.file_uploader(
-            "Upload Sample Answers",
-            accept_multiple_files=True,
-            type=["pdf", "docx", "txt"],
-        )
+        
+        # Initialize variables
+        guideline_files = None
+        guideline_text = None
+        sample_answers_files = None
+        sample_answers_text = None
+        
+        # Show only the selected input method based on session state
+        if st.session_state.guideline_input_method == "Upload Files":
+            logger.debug("Showing file upload fields")
+            guideline_files = st.file_uploader(
+                "Upload Guideline Files",
+                accept_multiple_files=True,
+                type=["pdf", "docx", "txt"],
+            )
+            sample_answers_files = st.file_uploader(
+                "Upload Sample Answers",
+                accept_multiple_files=True,
+                type=["pdf", "docx", "txt"],
+            )
+        else:  # Text Input
+            logger.debug("Showing text input fields")
+            guideline_text = st.text_area(
+                "Enter Guidelines",
+                help="Enter the guidelines for this question directly as text."
+            )
+            sample_answers_text = st.text_area(
+                "Enter Sample Answers",
+                help="Enter the sample answers for this question directly as text."
+            )
+            
         instructions = st.text_area("Additional Instructions")
         submit_question = st.form_submit_button("Add Question")
 
         if submit_question and question_text:
             question_id = str(uuid.uuid4())
             guideline_vector_db_url = None
+            guideline_text_content = None
+            sample_answers_vector_db_url = None
+            sample_answers_text_content = None
+            is_textbox = st.session_state.guideline_input_method == "Text Input"
             
-            # Process guideline files
-            if guideline_files:
-                documents = []
-                for file in guideline_files:
-                    try:
-                        content = process_uploaded_file(file)
-                        documents.append(content)
-                    except Exception as e:
-                        st.error(f"Error processing file {file.name}: {str(e)}")
-                        continue
+            # Log the values for debugging
+            logger.info(f"Creating new question with input method: {st.session_state.guideline_input_method}")
+            logger.info(f"is_textbox value being set to: {is_textbox}")
+            logger.info(f"is_textbox type: {type(is_textbox)}")
+            
+            # Process guidelines based on input method
+            if st.session_state.guideline_input_method == "Upload Files":
+                logger.info("Processing as file upload")
+                # For file upload: Process and store in vector DB only
+                if guideline_files:
+                    documents = []
+                    for file in guideline_files:
+                        try:
+                            content = process_uploaded_file(file)
+                            documents.append(content)
+                        except Exception as e:
+                            st.error(f"Error processing file {file.name}: {str(e)}")
+                            continue
+                    
+                    if documents:  # Only proceed if we have successfully processed documents
+                        # Create vector store with unique namespace for this question's guidelines
+                        namespace = f"question_{question_id}_guidelines"
+                        vector_store = create_vector_store(documents, namespace)
+                        guideline_vector_db_url = namespace
                 
-                if documents:  # Only proceed if we have successfully processed documents
-                    # Create vector store with unique namespace for this question
-                    namespace = f"question_{question_id}_guidelines"
-                    vector_store = create_vector_store(documents, namespace)
-                    guideline_vector_db_url = namespace
+                # Process sample answers files
+                if sample_answers_files:
+                    documents = []
+                    for file in sample_answers_files:
+                        try:
+                            content = process_uploaded_file(file)
+                            documents.append(content)
+                        except Exception as e:
+                            st.error(f"Error processing file {file.name}: {str(e)}")
+                            continue
+                    
+                    if documents:  # Only proceed if we have successfully processed documents
+                        # Create vector store with unique namespace for this question's sample answers
+                        namespace = f"question_{question_id}_sample_answers"
+                        vector_store = create_vector_store(documents, namespace)
+                        sample_answers_vector_db_url = namespace
+            
+            else:  # Text Input
+                # For text input: Store in postgres only, no vector DB
+                guideline_text_content = guideline_text
+                sample_answers_text_content = sample_answers_text
 
-            # Process sample answers files
-            sample_answers = []
-            if sample_answers_files:
-                for file in sample_answers_files:
-                    try:
-                        content = process_uploaded_file(file)
-                        sample_answers.append(content)
-                    except Exception as e:
-                        st.error(f"Error processing file {file.name}: {str(e)}")
-                        continue
-
+            # Before database insert
+            logger.info("=== Database Operation ===")
+            logger.info(f"About to insert question with is_textbox={is_textbox} ({type(is_textbox)})")
+            logger.info(f"Guideline vector DB URL: {guideline_vector_db_url}")
+            logger.info(f"Sample answers vector DB URL: {sample_answers_vector_db_url}")
             cursor.execute(
-                "INSERT INTO questions (id, text, guideline_vector_db_url, sample_answers, instructions, subject_id) VALUES (%s, %s, %s, %s, %s, %s)",
+                """INSERT INTO questions 
+                   (id, text, guideline_vector_db_url, guideline_text_box, is_textbox, 
+                    sample_answers_vector_db_url, sample_answers_textbox, instructions, subject_id) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING is_textbox""",
                 (
                     question_id,
                     question_text,
-                    guideline_vector_db_url,
-                    sample_answers,
+                    guideline_vector_db_url,      # Will be None for text input
+                    guideline_text_content,        # Will be None for file upload
+                    is_textbox,                    # True for text input, False for file upload
+                    sample_answers_vector_db_url,  # Will be None for text input
+                    sample_answers_text_content,   # Will be None for file upload
                     instructions,
                     st.session_state.current_subject,
                 ),
             )
+            stored_value = cursor.fetchone()[0]
+            logger.info(f"Value stored in database: {stored_value} ({type(stored_value)})")
             conn.commit()
             st.success("Question added successfully!")
 
     # Display existing questions
     st.subheader("Existing Questions")
     cursor.execute(
-        "SELECT * FROM questions WHERE subject_id = %s",
+        """
+        SELECT 
+            q.*, 
+            to_char(q.created_at, 'YYYY-MM-DD') as formatted_date 
+        FROM questions q 
+        WHERE subject_id = %s
+        """,
         (st.session_state.current_subject,),
     )
     questions = cursor.fetchall()
     if questions:
         for question in questions:
             with st.expander(f"📝 {question[1][:100]}..."):
-                st.write("Instructions:", question[4])
-                st.write(f"Created: {question[5].strftime('%Y-%m-%d')}")
+                st.write("Instructions:", question[6])  # instructions is at index 6
+                # Convert is_textbox to boolean and log its value
+                is_textbox = bool(question[4])
+                logger.debug(f"Question display - is_textbox raw value: {question[4]}, converted: {is_textbox}")
+                if is_textbox:  # Using converted boolean
+                    st.write("Guidelines (Text):", question[3])  # guideline_text_box
+                    if question[7]:  # sample_answers_textbox
+                        st.write("Sample Answers (Text):", question[7])
+                else:
+                    if question[2]:  # guideline_vector_db_url
+                        st.write("Guidelines: [File Upload]")
+                    if question[5]:  # sample_answers_vector_db_url
+                        st.write("Sample Answers: [File Upload]")
+                st.write(f"Created: {question[10]}")  # Using the formatted date from the query
+                
+                # Add delete button
+                if st.button("Delete Question", key=f"delete_question_{question[0]}"):
+                    if delete_question(question[0]):
+                        st.success("Question deleted successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to delete question")
     else:
         st.info("No questions added yet.")
 
@@ -460,161 +889,50 @@ def show_answer_generation():
     with col2:
         student_id = st.text_input("Student ID")
 
-    # Question selection
-    logger.info(f"Fetching questions for subject: {st.session_state.current_subject}")
-    
-    # First, get subject information
-    subject = execute_db_query(
-        "SELECT * FROM subjects WHERE id = %s",
-        (st.session_state.current_subject,),
-        fetch=True
-    )[0]
-    logger.info(f"Retrieved subject information: {subject[1]} (ID: {subject[0]})")
-
-    questions = execute_db_query(
-        "SELECT * FROM questions WHERE subject_id = %s",
-        (st.session_state.current_subject,),
-        fetch=True
-    )
-    logger.info(f"Retrieved {len(questions)} questions from database")
-    
-    if questions:
-        # Log question details for debugging
-        for q in questions:
-            logger.debug(f"Question ID: {q[0]}, Text: {q[1][:100]}...")
-
-        selected_question = st.selectbox(
-            "Select Question",
-            options=[q[0] for q in questions],
-            format_func=lambda x: next(q[1] for q in questions if q[0] == x)[:100] + "...",
-        )
-
-        # Generate answer button
-        if st.button("Generate Answer"):
-            if student_name and student_id:
-                # Retrieve question details
-                logger.info(f"Fetching details for question: {selected_question}")
-                question = execute_db_query(
-                    "SELECT * FROM questions WHERE id = %s",
-                    (selected_question,),
-                    fetch=True
-                )[0]
-                
-                logger.info(f"Question details retrieved - ID: {question[0]}")
-                logger.info(f"Question full details: Text: {question[1][:100]}..., Guidelines URL: {question[2]}")
-
-                try:
-                    # Initialize OpenAI embeddings
+    # Generate all answers button
+    if st.button("Generate All Answers"):
+        if student_name and student_id:
+            try:
+                with st.spinner("Generating answers for all questions... This may take a while."):
+                    # Initialize OpenAI embeddings and LLM
                     embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
-                    retrieved_content = []
-
-                    # 1. First, get subject-level information (always available)
-                    logger.info(f"Getting subject-level information from namespace: {subject[3]}")
-                    subject_vector_store = LangchainPinecone.from_existing_index(
-                        index_name=INDEX_NAME,
-                        embedding=embeddings,
-                        namespace=subject[3]  # subject vector_db_url
+                    llm = ChatOpenAI(model="gpt-4", temperature=0.2)
+                    
+                    # Generate answers for all questions
+                    all_qa_pairs = generate_all_answers(
+                        st.session_state.current_subject,
+                        embeddings,
+                        llm
                     )
                     
-                    # Get subject vector store stats
-                    stats = index.describe_index_stats()
-                    subject_vectors = stats.namespaces.get(subject[3], {}).get('vector_count', 0)
-                    logger.info(f"Found {subject_vectors} vectors in subject information")
-                    
-                    # Retrieve relevant content from subject information
-                    subject_retriever = subject_vector_store.as_retriever(search_kwargs={"k": 5})
-                    subject_docs = subject_retriever.get_relevant_documents(question[1])  # Use question text directly
-                    logger.info(f"Retrieved {len(subject_docs)} relevant chunks from subject information")
-                    st.info(f"Using {len(subject_docs)} relevant chunks from subject information")
-                    
-                    # Add subject content to retrieved content
-                    retrieved_content.extend([doc.page_content for doc in subject_docs])
-
-                    # 2. Try to get question-specific guidelines if available
-                    if question[2]:  # If there's a guideline vector DB URL
-                        try:
-                            logger.info(f"Getting question guidelines from namespace: {question[2]}")
-                            question_vector_store = LangchainPinecone.from_existing_index(
-                                index_name=INDEX_NAME,
-                                embedding=embeddings,
-                                namespace=question[2]
+                    if all_qa_pairs:
+                        st.success("Successfully generated all answers!")
+                        
+                        # Create temporary file for all Q&As
+                        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp_all_qa:
+                            create_all_qa_doc(all_qa_pairs, tmp_all_qa.name)
+                            with open(tmp_all_qa.name, 'rb') as docx_file:
+                                docx_bytes = docx_file.read()
+                            st.download_button(
+                                "Download All Q&As (DOCX)",
+                                data=docx_bytes,
+                                file_name=f"all_qa_{student_id}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                             )
                             
-                            # Get question guideline stats
-                            question_vectors = stats.namespaces.get(question[2], {}).get('vector_count', 0)
-                            if question_vectors > 0:
-                                logger.info(f"Found {question_vectors} vectors in question guidelines")
-                                
-                                # Retrieve relevant content from guidelines
-                                guideline_retriever = question_vector_store.as_retriever(search_kwargs={"k": 3})
-                                guideline_docs = guideline_retriever.get_relevant_documents(question[1])
-                                logger.info(f"Retrieved {len(guideline_docs)} relevant chunks from guidelines")
-                                st.info(f"Using {len(guideline_docs)} relevant chunks from question guidelines")
-                                
-                                # Add guideline content to retrieved content
-                                retrieved_content.extend([doc.page_content for doc in guideline_docs])
-                        except Exception as e:
-                            logger.warning(f"Could not use question guidelines: {str(e)}")
-                    
-                    # Get additional context if available
-                    additional_context = ""
-                    if question[3] and len(question[3]) > 0:  # Sample answers
-                        logger.info("Adding sample answers to context")
-                        additional_context += "\nSample Answers:\n" + "\n".join(question[3])
-                    
-                    if question[4]:  # Instructions
-                        logger.info("Adding instructions to context")
-                        additional_context += "\nInstructions:\n" + question[4]
-
-                    # Prepare the prompt with all retrieved content
-                    prompt = f"""Question: {question[1]}
-
-Retrieved Information:
-{'-' * 50}
-{'\n'.join(retrieved_content)}
-{'-' * 50}
-
-{additional_context}
-
-Please provide a comprehensive answer to the question using the retrieved information above."""
-
-                    logger.info("Generating answer using combined information")
-                    
-                    # Generate answer using the combined information
-                    llm = ChatOpenAI(model="gpt-4", temperature=0.2)
-                    answer = llm.predict(prompt)
-                    
-                    logger.info("Answer generated successfully")
-                    logger.debug(f"Generated answer: {answer[:100]}...")
-                    
-                    st.success("Answer generated successfully!")
-                    st.write(answer)
-
-                    # Download options
-                    st.subheader("Download Options")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.download_button(
-                            "Download Answer Only",
-                            data=answer,
-                            file_name=f"answer_{student_id}.txt",
-                        )
-                    with col2:
-                        st.download_button(
-                            "Download Answer with Questions",
-                            data=f"Question: {question[1]}\n\nAnswer: {answer}",
-                            file_name=f"full_answer_{student_id}.txt",
-                        )
-                except Exception as e:
-                    error_msg = f"Error during answer generation: {str(e)}"
-                    logger.error(error_msg)
-                    st.error(error_msg)
-            else:
-                logger.warning("Attempted to generate answer without student information")
-                st.warning("Please enter student name and ID.")
-    else:
-        logger.info("No questions found for the current subject")
-        st.info("No questions available. Please add questions in Question Management.")
+                            # Cleanup temporary file
+                            try:
+                                os.unlink(tmp_all_qa.name)
+                            except Exception as e:
+                                logger.warning(f"Error cleaning up temporary file: {str(e)}")
+                    else:
+                        st.warning("No questions found for the current subject.")
+            except Exception as e:
+                error_msg = f"Error generating answers: {str(e)}"
+                logger.error(error_msg)
+                st.error(error_msg)
+        else:
+            st.warning("Please enter student name and ID.")
 
 
 if __name__ == "__main__":

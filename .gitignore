@@ -7,3 +7,5 @@ __pycache__/
 *.pyz
 .env
 app.log
+
+env.py
