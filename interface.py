@@ -203,6 +203,67 @@ def create_vector_store(documents: List[str], namespace: str) -> LangchainPineco
         raise
 
 
+def process_file_uploads(files, question_id: str, content_type: str) -> tuple[str | None, list]:
+    """
+    Process uploaded files and create vector store
+    
+    Args:
+        files: The uploaded files
+        question_id: UUID of the question
+        content_type: Type of content ('guidelines' or 'sample_answers')
+    
+    Returns:
+        tuple: (vector_db_url, processed_documents)
+    """
+    if not files:
+        return None, []
+
+    documents = []
+    for file in files:
+        try:
+            content = process_uploaded_file(file)
+            documents.append(content)
+        except Exception as e:
+            st.error(f"Error processing {content_type} file {file.name}: {str(e)}")
+            continue
+
+    if documents:
+        namespace = f"question_{question_id}_{content_type}"
+        vector_store = create_vector_store(documents, namespace)
+        return namespace, documents
+    
+    return None, []
+
+
+def handle_content_input(
+    input_method: str,
+    files,
+    text_content: str,
+    question_id: str,
+    content_type: str
+) -> tuple[str | None, str | None]:
+    """
+    Handle both file and text input methods
+    
+    Args:
+        input_method: "Upload Files" or "Text Input"
+        files: Uploaded files (if any)
+        text_content: Text input content (if any)
+        question_id: UUID of the question
+        content_type: Type of content ('guidelines' or 'sample_answers')
+    
+    Returns:
+        tuple: (vector_db_url, text_content)
+    """
+    if input_method == "Upload Files":
+        logger.info(f"Processing {content_type} as file upload")
+        vector_db_url, _ = process_file_uploads(files, question_id, content_type)
+        return vector_db_url, None
+    else:
+        logger.info(f"Processing {content_type} as text input")
+        return None, text_content
+
+
 def execute_db_query(query: str, params: tuple = None, fetch: bool = False) -> Any:
     """Execute a database query with logging"""
     try:
@@ -344,16 +405,19 @@ def generate_all_answers(subject_id: str, embeddings, llm) -> list:
             additional_context.append(f"Instructions:\n{q[6]}")
         
         # Prepare prompt and generate answer
-        prompt = f"""Question: {q[1]}
+        prompt = """
+            Question: {}
 
-Retrieved Information:
-{'-' * 50}
-{'\n'.join(retrieved_content)}
-{'-' * 50}
+            Retrieved Information:
+            {}
 
-{'\n\n'.join(additional_context)}
+            {}
 
-You are an expert in the subject of the question. Please provide a comprehensive answer to the question using the retrieved information above."""
+            You are an expert in the subject of the question. Please provide a comprehensive answer to the question using the retrieved information above.""".format(
+            q[1],
+            "-" * 50 + "\n" + "\n".join(retrieved_content) + "\n" + "-" * 50,
+            "\n\n".join(additional_context),
+        )
         
         answer = llm.predict(prompt)
         qa_pairs.append((q[1], answer))
@@ -724,27 +788,43 @@ def show_question_management():
     # Initialize the guideline input method in session state if not present
     if "guideline_input_method" not in st.session_state:
         st.session_state.guideline_input_method = "Upload Files"
+    if "sample_answer_input_method" not in st.session_state:
+        st.session_state.sample_answer_input_method = "Upload Files"
 
+    col1, col2 = st.columns(2)
+    with col1:
     # Add radio button outside the form for instant updates
-    selected_method = st.radio(
-        "How would you like to provide guidelines and sample answers?",
-        ["Upload Files", "Text Input"]
-    )
+        selected_method_for_guideline = st.radio(
+            "How would you like to provide guidelines?",
+            ["Upload Files", "Text Input"],
+            key="guideline",
+        )
+    with col2:
+        selected_method_for_sample_answers = st.radio(
+            "How would you like to provide sample answers?",
+            ["Upload Files", "Text Input"],
+            key="sample_answer",
+        )
     # Update session state and log the selection
-    st.session_state.guideline_input_method = selected_method
-    logger.info(f"Selected input method: {selected_method}")
-    
+    st.session_state.guideline_input_method = selected_method_for_guideline
+    logger.info(f"Selected guideline input method: {selected_method_for_guideline}")
+
+    st.session_state.sample_answer_input_method = selected_method_for_sample_answers
+    logger.info(
+        f"Selected guideline input method: {selected_method_for_sample_answers}"
+    )
+
     # Create new question
     with st.form(key="question_form"):
         st.subheader("Add New Question")
         question_text = st.text_area("Question Text")
-        
+
         # Initialize variables
         guideline_files = None
         guideline_text = None
         sample_answers_files = None
         sample_answers_text = None
-        
+
         # Show only the selected input method based on session state
         if st.session_state.guideline_input_method == "Upload Files":
             logger.debug("Showing file upload fields")
@@ -753,107 +833,82 @@ def show_question_management():
                 accept_multiple_files=True,
                 type=["pdf", "docx", "txt"],
             )
+        else:  # Text Input
+            logger.debug("Showing text input fields")
+            guideline_text = st.text_area(
+                "Enter Guidelines",
+                help="Enter the guidelines for this question directly as text.",
+            )
+
+        if st.session_state.sample_answer_input_method == "Upload Files":
             sample_answers_files = st.file_uploader(
                 "Upload Sample Answers",
                 accept_multiple_files=True,
                 type=["pdf", "docx", "txt"],
             )
-        else:  # Text Input
-            logger.debug("Showing text input fields")
-            guideline_text = st.text_area(
-                "Enter Guidelines",
-                help="Enter the guidelines for this question directly as text."
-            )
+        else:
             sample_answers_text = st.text_area(
                 "Enter Sample Answers",
-                help="Enter the sample answers for this question directly as text."
+                help="Enter the sample answers for this question directly as text.",
             )
-            
+
         instructions = st.text_area("Additional Instructions")
         submit_question = st.form_submit_button("Add Question")
 
         if submit_question and question_text:
-            question_id = str(uuid.uuid4())
-            guideline_vector_db_url = None
-            guideline_text_content = None
-            sample_answers_vector_db_url = None
-            sample_answers_text_content = None
-            is_textbox = st.session_state.guideline_input_method == "Text Input"
-            
-            # Log the values for debugging
-            logger.info(f"Creating new question with input method: {st.session_state.guideline_input_method}")
-            logger.info(f"is_textbox value being set to: {is_textbox}")
-            logger.info(f"is_textbox type: {type(is_textbox)}")
-            
-            # Process guidelines based on input method
-            if st.session_state.guideline_input_method == "Upload Files":
-                logger.info("Processing as file upload")
-                # For file upload: Process and store in vector DB only
-                if guideline_files:
-                    documents = []
-                    for file in guideline_files:
-                        try:
-                            content = process_uploaded_file(file)
-                            documents.append(content)
-                        except Exception as e:
-                            st.error(f"Error processing file {file.name}: {str(e)}")
-                            continue
-                    
-                    if documents:  # Only proceed if we have successfully processed documents
-                        # Create vector store with unique namespace for this question's guidelines
-                        namespace = f"question_{question_id}_guidelines"
-                        vector_store = create_vector_store(documents, namespace)
-                        guideline_vector_db_url = namespace
+            with st.spinner("Please wait, it may take some time"):
+                question_id = str(uuid.uuid4())
                 
-                # Process sample answers files
-                if sample_answers_files:
-                    documents = []
-                    for file in sample_answers_files:
-                        try:
-                            content = process_uploaded_file(file)
-                            documents.append(content)
-                        except Exception as e:
-                            st.error(f"Error processing file {file.name}: {str(e)}")
-                            continue
-                    
-                    if documents:  # Only proceed if we have successfully processed documents
-                        # Create vector store with unique namespace for this question's sample answers
-                        namespace = f"question_{question_id}_sample_answers"
-                        vector_store = create_vector_store(documents, namespace)
-                        sample_answers_vector_db_url = namespace
+                # Process guidelines
+                guideline_vector_db_url, guideline_text_content = handle_content_input(
+                    input_method=st.session_state.guideline_input_method,
+                    files=guideline_files,
+                    text_content=guideline_text,
+                    question_id=question_id,
+                    content_type="guidelines"
+                )
             
-            else:  # Text Input
-                # For text input: Store in postgres only, no vector DB
-                guideline_text_content = guideline_text
-                sample_answers_text_content = sample_answers_text
-
-            # Before database insert
-            logger.info("=== Database Operation ===")
-            logger.info(f"About to insert question with is_textbox={is_textbox} ({type(is_textbox)})")
-            logger.info(f"Guideline vector DB URL: {guideline_vector_db_url}")
-            logger.info(f"Sample answers vector DB URL: {sample_answers_vector_db_url}")
-            cursor.execute(
-                """INSERT INTO questions 
-                   (id, text, guideline_vector_db_url, guideline_text_box, is_textbox, 
-                    sample_answers_vector_db_url, sample_answers_textbox, instructions, subject_id) 
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   RETURNING is_textbox""",
-                (
-                    question_id,
-                    question_text,
-                    guideline_vector_db_url,      # Will be None for text input
-                    guideline_text_content,        # Will be None for file upload
-                    is_textbox,                    # True for text input, False for file upload
-                    sample_answers_vector_db_url,  # Will be None for text input
-                    sample_answers_text_content,   # Will be None for file upload
-                    instructions,
-                    st.session_state.current_subject,
-                ),
-            )
-            stored_value = cursor.fetchone()[0]
-            logger.info(f"Value stored in database: {stored_value} ({type(stored_value)})")
-            conn.commit()
-            st.success("Question added successfully!")
+                # Process sample answers
+                sample_answers_vector_db_url, sample_answers_text_content = handle_content_input(
+                    input_method=st.session_state.sample_answer_input_method,
+                    files=sample_answers_files,
+                    text_content=sample_answers_text,
+                    question_id=question_id,
+                    content_type="sample_answers"
+                )
+            
+                # Set boolean flags based on input methods
+                is_guideline_textbox = st.session_state.guideline_input_method == "Text Input"
+                is_sample_answer_textbox = st.session_state.sample_answer_input_method == "Text Input"
+                
+                
+                # Before database insert
+                logger.info("=== Database Operation ===")
+                logger.info(f"Guideline vector DB URL: {guideline_vector_db_url}")
+                logger.info(f"Sample answers vector DB URL: {sample_answers_vector_db_url}")
+                cursor.execute(
+                    """INSERT INTO questions 
+                    (id, text, guideline_vector_db_url, guideline_text_box, is_guideline_textbox, 
+                        sample_answers_vector_db_url, sample_answers_textbox,is_sample_answer_textbox, instructions, subject_id) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING is_guideline_textbox""",
+                    (
+                        question_id,
+                        question_text,
+                        guideline_vector_db_url,  # Will be None for text input
+                        guideline_text_content,  # Will be None for file upload
+                        is_guideline_textbox,  # True for text input, False for file upload
+                        sample_answers_vector_db_url,  # Will be None for text input
+                        sample_answers_text_content, # Will be None for file upload
+                        is_sample_answer_textbox,
+                        instructions,
+                        st.session_state.current_subject,
+                    ),
+                )
+                stored_value = cursor.fetchone()[0]
+                logger.info(f"Value stored in database: {stored_value} ({type(stored_value)})")
+                conn.commit()
+                st.success("Question added successfully!")
 
     # Display existing questions
     st.subheader("Existing Questions")
@@ -868,24 +923,40 @@ def show_question_management():
         (st.session_state.current_subject,),
     )
     questions = cursor.fetchall()
+    logger.info(f"questions: {questions}")
     if questions:
         for question in questions:
-            with st.expander(f"📝 {question[1][:100]}..."):
-                st.write("Instructions:", question[6])  # instructions is at index 6
-                # Convert is_textbox to boolean and log its value
-                is_textbox = bool(question[4])
-                logger.debug(f"Question display - is_textbox raw value: {question[4]}, converted: {is_textbox}")
-                if is_textbox:  # Using converted boolean
-                    st.write("Guidelines (Text):", question[3])  # guideline_text_box
-                    if question[7]:  # sample_answers_textbox
-                        st.write("Sample Answers (Text):", question[7])
-                else:
-                    if question[2]:  # guideline_vector_db_url
-                        st.write("Guidelines: [File Upload]")
-                    if question[5]:  # sample_answers_vector_db_url
-                        st.write("Sample Answers: [File Upload]")
-                st.write(f"Created: {question[10]}")  # Using the formatted date from the query
+            question_text = question[1]
+            instructions = question[8]
+            guideline_text = question[3]
+            sample_answers_text = question[6]
+            sample_answers_file = question[5]
+            is_guideline_textbox = bool(question[4])
+            is_sample_answer_textbox = bool(question[7])
+            created_date = question[-1]
+
+            with st.expander(f"📝 {question_text}"):
+                # Display instructions if present
+                if instructions:
+                    st.write("Instructions:", instructions)
                 
+                # Display guidelines
+                guideline_label = "Guidelines:"
+                if is_guideline_textbox:
+                    st.write(f"{guideline_label} {guideline_text}")
+                else:
+                    st.write(f"{guideline_label} [File Upload]")
+                
+                # Display sample answers if present
+                sample_label = "Sample Answers:"
+                if is_sample_answer_textbox and sample_answers_text:
+                    st.write(f"{sample_label} {sample_answers_text}")
+                elif not is_sample_answer_textbox and sample_answers_file:
+                    st.write(f"{sample_label} [File Upload]")
+                
+                # Display creation date
+                st.write(f"Created At: {created_date}")
+
                 # Add delete button
                 if st.button("Delete Question", key=f"delete_question_{question[0]}"):
                     if delete_question(question[0]):
