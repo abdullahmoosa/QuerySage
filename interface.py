@@ -901,7 +901,7 @@ def show_question_management():
         (st.session_state.current_subject,),
     )
     questions = cursor.fetchall()
-    logger.info(f"questions: {questions}")
+
     if questions:
         for question in questions:
             question_text = question[1]
