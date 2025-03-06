@@ -17,6 +17,7 @@ from typing import List, Dict, Any
 from PyPDF2 import PdfReader
 from docx import Document
 import io
+from urllib.parse import quote_plus
 
 # Configure logging
 logging.basicConfig(
@@ -34,34 +35,40 @@ openai.api_key = os.environ["OPENAI_API_KEY"]
 PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 INDEX_NAME = "courseassesmentsystem"
 
+# Global variables for database and Pinecone connections
+conn = None
+cursor = None
+index = None
+
 # Initialize Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
-logger.info("Initializing Pinecone connection")
+def init_pinecone():
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    logger.info("Initializing Pinecone connection")
 
-# Create index if it doesn't exist
-if INDEX_NAME not in pc.list_indexes().names():
-    logger.info(f"Creating new Pinecone index: {INDEX_NAME}")
-    pc.create_index(
-        name=INDEX_NAME,
-        dimension=1536,
-        metric='cosine'
-    )
-    logger.info(f"Successfully created Pinecone index: {INDEX_NAME}")
-index = pc.Index(INDEX_NAME)
+    # Create index if it doesn't exist
+    if INDEX_NAME not in pc.list_indexes().names():
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=1536,
+            metric='cosine'
+        )
+        logger.info(f"Successfully created Pinecone index: {INDEX_NAME}")
+    return pc.Index(INDEX_NAME)
 
-# Initialize PostgreSQL connection
-try:
-    conn = psycopg2.connect(
-        dbname="postgres", user="postgres", password="postgres", host="localhost"
-    )
-    cursor = conn.cursor()
-    logger.info("Successfully connected to PostgreSQL database")
-except Exception as e:
-    logger.error(f"Failed to connect to PostgreSQL: {str(e)}")
-    raise
+# Initialize PostgreSQL
+def init_postgres():
+    try:
+        # Construct the connection string with the encoded password
+        connection_string = os.environ.get("DATABASE_URL")        
+        new_conn = psycopg2.connect(connection_string)
+        new_cursor = new_conn.cursor()
+        logger.info("Successfully connected to PostgreSQL database")
+        return new_conn, new_cursor
+    except Exception as e:
+        logger.error(f"Failed to connect to PostgreSQL: {str(e)}")
+        raise
 
 user_id = "0194b305-f06e-7661-810e-8f35c12ab058"
-
 
 def process_pdf(file_content) -> str:
     """Process PDF file and return its text content"""
@@ -535,7 +542,22 @@ def delete_course(course_id: str):
 def main():
     st.set_page_config(page_title="RAG Course Assessment System", layout="wide")
 
-    # Initialize session state
+    # Initialize session state for connections
+    if 'pinecone_index' not in st.session_state:
+        st.session_state.pinecone_index = init_pinecone()
+    
+    if 'postgres_conn' not in st.session_state:
+        new_conn, new_cursor = init_postgres()
+        st.session_state.postgres_conn = new_conn
+        st.session_state.postgres_cursor = new_cursor
+
+    # Use the persistent connections
+    global conn, cursor, index
+    conn = st.session_state.postgres_conn
+    cursor = st.session_state.postgres_cursor
+    index = st.session_state.pinecone_index
+
+    # Initialize other session state variables
     if "current_course" not in st.session_state:
         st.session_state.current_course = None
     if "current_subject" not in st.session_state:

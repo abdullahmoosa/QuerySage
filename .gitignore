@@ -10,3 +10,4 @@ __pycache__/
 app.log
 
 env.py
+data.sql
