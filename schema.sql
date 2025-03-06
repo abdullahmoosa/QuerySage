@@ -1,5 +1,5 @@
 -- Create courses table
-CREATE TABLE courses (
+CREATE TABLE IF NOT EXISTS courses (
     id UUID PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     user_id UUID NOT NULL,
@@ -7,7 +7,7 @@ CREATE TABLE courses (
 );
 
 -- Create subjects table
-CREATE TABLE subjects (
+CREATE TABLE IF NOT EXISTS subjects (
     id UUID PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     course_id UUID REFERENCES courses(id),
@@ -16,7 +16,7 @@ CREATE TABLE subjects (
 );
 
 -- Create questions table
-CREATE TABLE questions (
+CREATE TABLE IF NOT EXISTS questions (
     id UUID PRIMARY KEY,
     text TEXT NOT NULL,
     guideline_vector_db_url TEXT,
