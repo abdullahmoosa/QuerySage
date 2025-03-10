@@ -21,9 +21,10 @@ CREATE TABLE IF NOT EXISTS questions (
     text TEXT NOT NULL,
     guideline_vector_db_url TEXT,
     guideline_text_box TEXT,
-    is_textbox BOOLEAN DEFAULT FALSE,
+    is_guideline_textbox BOOLEAN DEFAULT FALSE,
     sample_answers_vector_db_url TEXT,
     sample_answers_textbox TEXT,
+    is_sample_answer_textbox BOOLEAN DEFAULT FALSE,
     instructions TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     subject_id UUID REFERENCES subjects(id)
