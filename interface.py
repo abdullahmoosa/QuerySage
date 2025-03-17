@@ -18,6 +18,7 @@ from PyPDF2 import PdfReader
 from docx import Document
 import io
 from urllib.parse import quote_plus
+from supabase import create_client, Client
 
 # Configure logging
 logging.basicConfig(
@@ -35,10 +36,24 @@ openai.api_key = os.environ["OPENAI_API_KEY"]
 PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
 INDEX_NAME = "courseassesmentsystem"
 
+# Extract Supabase URL and key from the DATABASE_URL
+# Format: postgresql://postgres:password@aws-0-us-west-1.pooler.supabase.com:6543/postgres?options=reference%3Dtmwetgegqdxnibsmwrxy
+db_url = os.environ.get("DATABASE_URL", "")
+# The project reference is in the options parameter
+supabase_ref = db_url.split("reference%3D")[-1] if "reference%3D" in db_url else ""
+# Construct Supabase URL and key (these should ideally be in .env)
+SUPABASE_URL = f"https://{supabase_ref}.supabase.co"
+# For security, the anon key should be in .env, but we'll use a placeholder for now
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRtd2V0Z2VncWR4bmliczt3cnh5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MTU5NTI2MDAsImV4cCI6MjAzMTUyODYwMH0.placeholder")
+# Get the service role key if available (has admin privileges)
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
 # Global variables for database and Pinecone connections
 conn = None
 cursor = None
 index = None
+supabase = None
+supabase_admin = None
 
 # Initialize Pinecone
 def init_pinecone():
@@ -54,6 +69,26 @@ def init_pinecone():
         )
         logger.info(f"Successfully created Pinecone index: {INDEX_NAME}")
     return pc.Index(INDEX_NAME)
+
+# Initialize Supabase
+def init_supabase():
+    try:
+        logger.info(f"Initializing Supabase connection to {SUPABASE_URL}")
+        
+        # Create client with anon key for regular operations
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        
+        # If service role key is available, create an admin client
+        sb_admin = None
+        if SUPABASE_SERVICE_KEY:
+            logger.info("Service role key found, creating admin client")
+            sb_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        
+        logger.info("Successfully connected to Supabase")
+        return sb, sb_admin
+    except Exception as e:
+        logger.error(f"Failed to connect to Supabase: {str(e)}")
+        raise
 
 # Initialize PostgreSQL
 def init_postgres():
@@ -84,6 +119,71 @@ def process_pdf(file_content) -> str:
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}")
         raise
+
+def docx_to_markdown(docx_path):
+    """Convert a DOCX file to markdown format"""
+    try:
+        doc = Document(docx_path)
+        markdown_content = []
+
+        # Process paragraphs
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():
+                # Check for heading style
+                if paragraph.style.name.startswith('Heading'):
+                    level = int(paragraph.style.name[-1]) if paragraph.style.name[-1].isdigit() else 1
+                    markdown_content.append('#' * level + ' ' + paragraph.text)
+                else:
+                    # Handle text formatting
+                    text = paragraph.text
+                    
+                    # Check for bold, italic, etc.
+                    for run in paragraph.runs:
+                        if run.bold:
+                            text = text.replace(run.text, f"**{run.text}**")
+                        if run.italic:
+                            text = text.replace(run.text, f"*{run.text}*")
+                        if run.underline:
+                            text = text.replace(run.text, f"__{run.text}__")
+                    
+                    markdown_content.append(text)
+
+        # Process tables
+        for table in doc.tables:
+            table_rows = []
+            
+            # Process header row
+            header_row = []
+            for cell in table.rows[0].cells:
+                header_row.append(cell.text.strip())
+            table_rows.append("| " + " | ".join(header_row) + " |")
+            
+            # Add separator row
+            separator = "|" + "|".join(["---"] * len(header_row)) + "|"
+            table_rows.append(separator)
+            
+            # Process data rows
+            for row in table.rows[1:]:
+                row_cells = []
+                for cell in row.cells:
+                    row_cells.append(cell.text.strip())
+                table_rows.append("| " + " | ".join(row_cells) + " |")
+            
+            # Add table to markdown content
+            markdown_content.append("\n".join(table_rows))
+
+        # Handle lists (basic implementation)
+        # This is a simplified approach; a more robust implementation would track list levels
+        
+        return "\n\n".join(markdown_content)
+    except Exception as e:
+        logger.error(f"Error converting DOCX to markdown: {str(e)}")
+        # Return a simple text extraction as fallback
+        try:
+            doc = Document(docx_path)
+            return "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        except:
+            return "Error processing template document"
 
 def process_docx(file_content) -> str:
     """Process DOCX file and return its text content"""
@@ -121,6 +221,52 @@ def process_txt(file_content) -> str:
         except Exception as e:
             logger.error(f"Error processing TXT: {str(e)}")
             raise
+
+def upload_template_to_supabase(file, question_id: str) -> str:
+    """
+    Upload a template file to Supabase storage
+    
+    Args:
+        file: The uploaded file
+        question_id: UUID of the question
+    
+    Returns:
+        str: The URL of the uploaded file
+    """
+    try:
+        logger.info(f"Uploading template file {file.name} for question {question_id}")
+        
+        # Create a unique file name to avoid collisions
+        file_extension = os.path.splitext(file.name)[1].lower()
+        unique_filename = f"template_{question_id}{file_extension}"
+        
+        # Upload to Supabase storage
+        file_content = file.getvalue()
+        bucket_name = "templates"
+        
+        # Ensure the bucket exists with proper permissions
+        ensure_storage_bucket_exists(bucket_name, public=True)
+        
+        # Try to upload the file
+        try:
+            # Upload the file
+            supabase.storage.from_(bucket_name).upload(
+                path=unique_filename,
+                file=file_content,
+                file_options={"content-type": file.type}
+            )
+            
+            # Get the public URL
+            file_url = supabase.storage.from_(bucket_name).get_public_url(unique_filename)
+            logger.info(f"Successfully uploaded template file to {file_url}")
+            
+            return file_url
+        except Exception as upload_error:
+            logger.error(f"Error uploading file: {str(upload_error)}")
+            raise Exception(f"Failed to upload file: {str(upload_error)}")
+    except Exception as e:
+        logger.error(f"Failed to upload template file: {str(e)}")
+        raise
 
 def process_uploaded_file(uploaded_file):
     """Process an uploaded file and return its text content"""
@@ -358,13 +504,13 @@ def generate_all_answers(subject_id: str, embeddings, llm) -> list:
         retrieved_content.extend([doc.page_content for doc in subject_docs])
         
         # 2. Get question-specific guidelines
-        is_textbox = q[4]  # is_textbox
+        is_guideline_textbox = q[4]  # is_guideline_textbox
         guideline_text = q[3]  # guideline_text_box
         guideline_vector_db_url = q[2]  # guideline_vector_db_url
         
-        if is_textbox and guideline_text:
+        if is_guideline_textbox and guideline_text:
             retrieved_content.append(f"Question Guidelines:\n{guideline_text}")
-        elif not is_textbox and guideline_vector_db_url:
+        elif not is_guideline_textbox and guideline_vector_db_url:
             try:
                 question_vector_store = LangchainPinecone.from_existing_index(
                     index_name=INDEX_NAME,
@@ -381,8 +527,9 @@ def generate_all_answers(subject_id: str, embeddings, llm) -> list:
         additional_context = []
         
         # 3. Handle sample answers based on input type
-        if is_textbox:
-            sample_answers_text = q[7]  # sample_answers_textbox
+        is_sample_answer_textbox = q[7]  # is_sample_answer_textbox
+        if is_sample_answer_textbox:
+            sample_answers_text = q[6]  # sample_answers_textbox
             if sample_answers_text:
                 additional_context.append(f"Sample Answers:\n{sample_answers_text}")
         else:
@@ -401,8 +548,42 @@ def generate_all_answers(subject_id: str, embeddings, llm) -> list:
                 except Exception as e:
                     logger.warning(f"Could not use sample answers from vector store: {str(e)}")
         
-        if q[6]:  # Instructions
-            additional_context.append(f"Instructions:\n{q[6]}")
+        if q[8]:  # Instructions
+            additional_context.append(f"Instructions:\n{q[8]}")
+        
+        # 4. Handle template if available
+        template_url = q[9]  # template_url
+        template_content = None
+        if template_url:
+            try:
+                logger.info(f"Found template at {template_url}, downloading...")
+                # Extract filename from URL
+                filename = template_url.split('/')[-1]
+                bucket_name = "templates"
+                
+                # Use admin client if available for download operations
+                storage_client = supabase_admin if supabase_admin else supabase
+                
+                # Download the file
+                template_data = storage_client.storage.from_(bucket_name).download(filename)
+                
+                # Convert to markdown
+                with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp_file:
+                    tmp_file.write(template_data)
+                    tmp_file_path = tmp_file.name
+                
+                template_content = docx_to_markdown(tmp_file_path)
+                
+                # Clean up temporary file
+                try:
+                    os.unlink(tmp_file_path)
+                except Exception as e:
+                    logger.warning(f"Error cleaning up temporary file: {str(e)}")
+                
+                logger.info("Successfully processed template")
+                additional_context.append(f"Template Structure:\n{template_content}")
+            except Exception as e:
+                logger.error(f"Failed to process template: {str(e)}")
         
         # Prepare prompt and generate answer
         prompt = """
@@ -413,10 +594,13 @@ def generate_all_answers(subject_id: str, embeddings, llm) -> list:
 
             {}
 
+            {}
+
             You are an expert in the subject of the question. Please provide a comprehensive answer to the question using the retrieved information above.""".format(
             q[1],
             "-" * 50 + "\n" + "\n".join(retrieved_content) + "\n" + "-" * 50,
             "\n\n".join(additional_context),
+            "Follow the template structure provided above when formatting your answer." if template_content else ""
         )
         
         answer = llm.predict(prompt)
@@ -441,8 +625,8 @@ def delete_question(question_id: str):
         # Get question data before deletion
         question = execute_db_query(
             """SELECT id, text, guideline_vector_db_url, guideline_text_box, 
-                     is_textbox::boolean, sample_answers_vector_db_url, 
-                     sample_answers_textbox, instructions, created_at, subject_id 
+                     is_guideline_textbox::boolean, sample_answers_vector_db_url, 
+                     sample_answers_textbox, instructions, created_at, subject_id, template_url 
               FROM questions 
               WHERE id = %s""",
             (question_id,),
@@ -453,21 +637,21 @@ def delete_question(question_id: str):
         logger.info(f"Question ID: {question_id}")
         logger.info(f"Question Text: {question[1][:100]}...")
         
-        # Debug log to show actual is_textbox value
-        logger.info(f"Raw is_textbox value from DB: {question[4]} (type: {type(question[4])})")
-        logger.info(f"Raw is_textbox value repr: {repr(question[4])}")
+        # Debug log to show actual is_guideline_textbox value
+        logger.info(f"Raw is_guideline_textbox value from DB: {question[4]} (type: {type(question[4])})")
+        logger.info(f"Raw is_guideline_textbox value repr: {repr(question[4])}")
         
-        # Properly check is_textbox value
-        is_textbox = bool(question[4])  # Convert to boolean to ensure proper type
-        logger.info(f"Converted is_textbox value: {is_textbox} (type: {type(is_textbox)})")
-        input_method = "Text Input" if is_textbox else "File Upload"
+        # Properly check is_guideline_textbox value
+        is_guideline_textbox = bool(question[4])  # Convert to boolean to ensure proper type
+        logger.info(f"Converted is_guideline_textbox value: {is_guideline_textbox} (type: {type(is_guideline_textbox)})")
+        input_method = "Text Input" if is_guideline_textbox else "File Upload"
         logger.info(f"Input Method: {input_method}")
         
         # Check for any vector stores to delete
         vector_stores_deleted = False
         
-        # For file upload questions (is_textbox = False), check and delete vector stores
-        if not is_textbox:  # Using the properly converted boolean value
+        # For file upload questions (is_guideline_textbox = False), check and delete vector stores
+        if not is_guideline_textbox:  # Using the properly converted boolean value
             logger.info("Question uses file upload - checking for vector stores")
             
             # Check and delete guideline vector store
@@ -498,6 +682,24 @@ def delete_question(question_id: str):
         
         if not vector_stores_deleted:
             logger.info("No vector stores were deleted")
+        
+        # Check and delete template file from Supabase storage
+        template_url = question[10]  # template_url
+        if template_url:
+            logger.info(f"Found template file to delete: {template_url}")
+            try:
+                # Extract filename from URL
+                filename = template_url.split('/')[-1]
+                bucket_name = "templates"
+                
+                # Use admin client if available for delete operations
+                storage_client = supabase_admin if supabase_admin else supabase
+                
+                # Delete the file
+                storage_client.storage.from_(bucket_name).remove([filename])
+                logger.info("✓ Template file deleted from Supabase storage")
+            except Exception as e:
+                logger.error(f"Failed to delete template file: {str(e)}")
         
         # Delete from database
         execute_db_query(
@@ -603,6 +805,81 @@ def delete_course(course_id: str):
         logger.error(f"❌ Error deleting course {course_id}: {str(e)}")
         return False
 
+def ensure_storage_bucket_exists(bucket_name="templates", public=True):
+    """
+    Ensure that the storage bucket exists and has the correct permissions
+    
+    Args:
+        bucket_name: Name of the bucket to create
+        public: Whether the bucket should be public
+    
+    Returns:
+        bool: True if the bucket exists or was created successfully
+    """
+    try:
+        # Use admin client if available for bucket operations
+        storage_client = supabase_admin if supabase_admin else supabase
+        
+        # Check if bucket exists
+        try:
+            buckets = storage_client.storage.list_buckets()
+            bucket_exists = any(bucket.name == bucket_name for bucket in buckets)
+            
+            if not bucket_exists:
+                logger.info(f"Creating new bucket: {bucket_name}")
+                try:
+                    # Create the bucket
+                    storage_client.storage.create_bucket(bucket_name, {'public': public})
+                    logger.info(f"Successfully created bucket: {bucket_name}")
+                    
+                    # If we have admin access, try to set up RLS policies
+                    if supabase_admin:
+                        try:
+                            # Create RLS policies for the bucket
+                            logger.info("Setting up RLS policies for the bucket")
+                            
+                            # Allow all operations for authenticated users
+                            # Note: This is a simplified approach. In production, you'd want more granular policies.
+                            sql = f"""
+                            BEGIN;
+                            -- Policy for SELECT (read) operations
+                            CREATE POLICY "Allow public access" ON storage.objects
+                                FOR SELECT USING (bucket_id = '{bucket_name}');
+                                
+                            -- Policy for INSERT (upload) operations
+                            CREATE POLICY "Allow uploads" ON storage.objects
+                                FOR INSERT WITH CHECK (bucket_id = '{bucket_name}');
+                                
+                            -- Policy for UPDATE operations
+                            CREATE POLICY "Allow updates" ON storage.objects
+                                FOR UPDATE USING (bucket_id = '{bucket_name}');
+                                
+                            -- Policy for DELETE operations
+                            CREATE POLICY "Allow deletions" ON storage.objects
+                                FOR DELETE USING (bucket_id = '{bucket_name}');
+                            COMMIT;
+                            """
+                            
+                            # Execute the SQL directly using the Postgres connection
+                            # This is a workaround since Supabase Python client doesn't have direct RLS policy management
+                            cursor.execute(sql)
+                            conn.commit()
+                            logger.info("Successfully set up RLS policies for the bucket")
+                        except Exception as e:
+                            logger.warning(f"Failed to set up RLS policies: {str(e)}")
+                except Exception as e:
+                    logger.warning(f"Failed to create bucket: {str(e)}. Will attempt to use it anyway if it exists.")
+            else:
+                logger.info(f"Bucket '{bucket_name}' already exists")
+            
+            return True
+        except Exception as e:
+            logger.warning(f"Error checking buckets: {str(e)}. Will attempt to use '{bucket_name}' bucket anyway.")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to ensure bucket exists: {str(e)}")
+        return False
+
 def main():
     st.set_page_config(page_title="RAG Course Assessment System", layout="wide")
 
@@ -614,12 +891,30 @@ def main():
         new_conn, new_cursor = init_postgres()
         st.session_state.postgres_conn = new_conn
         st.session_state.postgres_cursor = new_cursor
+    
+    if 'supabase_client' not in st.session_state or 'supabase_admin' not in st.session_state:
+        st.session_state.supabase_client, st.session_state.supabase_admin = init_supabase()
 
     # Use the persistent connections
-    global conn, cursor, index
+    global conn, cursor, index, supabase, supabase_admin
     conn = st.session_state.postgres_conn
     cursor = st.session_state.postgres_cursor
     index = st.session_state.pinecone_index
+    supabase = st.session_state.supabase_client
+    supabase_admin = st.session_state.supabase_admin
+    
+    # Ensure the templates bucket exists
+    if 'bucket_initialized' not in st.session_state:
+        try:
+            bucket_exists = ensure_storage_bucket_exists("templates", public=True)
+            st.session_state.bucket_initialized = bucket_exists
+            if bucket_exists:
+                logger.info("Templates bucket is ready for use")
+            else:
+                logger.warning("Templates bucket may not be properly set up")
+        except Exception as e:
+            logger.error(f"Error initializing templates bucket: {str(e)}")
+            st.session_state.bucket_initialized = False
 
     # Initialize other session state variables
     if "current_course" not in st.session_state:
@@ -852,6 +1147,14 @@ def show_question_management():
                 help="Enter the sample answers for this question directly as text.",
             )
 
+        # Add template file upload
+        template_file = st.file_uploader(
+            "Upload Answer Template (Optional)",
+            accept_multiple_files=False,
+            type=["docx"],
+            help="Upload a DOCX template that will be used when generating answers. The template structure will be preserved in the answer."
+        )
+
         instructions = st.text_area("Additional Instructions")
         submit_question = st.form_submit_button("Add Question")
 
@@ -876,21 +1179,32 @@ def show_question_management():
                     question_id=question_id,
                     content_type="sample_answers"
                 )
+                
+                # Process template file
+                template_url = None
+                if template_file:
+                    try:
+                        template_url = upload_template_to_supabase(template_file, question_id)
+                        st.success(f"Template file uploaded successfully!")
+                    except Exception as e:
+                        logger.error(f"Failed to upload template file: {str(e)}")
+                        st.error(f"Failed to upload template file: {str(e)}")
             
                 # Set boolean flags based on input methods
                 is_guideline_textbox = st.session_state.guideline_input_method == "Text Input"
                 is_sample_answer_textbox = st.session_state.sample_answer_input_method == "Text Input"
                 
-                
                 # Before database insert
                 logger.info("=== Database Operation ===")
                 logger.info(f"Guideline vector DB URL: {guideline_vector_db_url}")
                 logger.info(f"Sample answers vector DB URL: {sample_answers_vector_db_url}")
+                logger.info(f"Template URL: {template_url}")
                 cursor.execute(
                     """INSERT INTO questions 
                     (id, text, guideline_vector_db_url, guideline_text_box, is_guideline_textbox, 
-                        sample_answers_vector_db_url, sample_answers_textbox,is_sample_answer_textbox, instructions, subject_id) 
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        sample_answers_vector_db_url, sample_answers_textbox, is_sample_answer_textbox, 
+                        instructions, template_url, subject_id) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING is_guideline_textbox""",
                     (
                         question_id,
@@ -902,6 +1216,7 @@ def show_question_management():
                         sample_answers_text_content, # Will be None for file upload
                         is_sample_answer_textbox,
                         instructions,
+                        template_url,
                         st.session_state.current_subject,
                     ),
                 )
@@ -933,6 +1248,7 @@ def show_question_management():
             sample_answers_file = question[5]
             is_guideline_textbox = bool(question[4])
             is_sample_answer_textbox = bool(question[7])
+            template_url = question[9]  # New template_url column
             created_date = question[-1]
 
             with st.expander(f"📝 {question_text}"):
@@ -953,6 +1269,10 @@ def show_question_management():
                     st.write(f"{sample_label} {sample_answers_text}")
                 elif not is_sample_answer_textbox and sample_answers_file:
                     st.write(f"{sample_label} [File Upload]")
+                
+                # Display template information
+                if template_url:
+                    st.write(f"Template: [Available]({template_url})")
                 
                 # Display creation date
                 st.write(f"Created At: {created_date}")
