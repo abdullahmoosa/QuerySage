@@ -7,4 +7,5 @@ langchain-community==0.3.16
 openai==1.60.2
 python-dotenv==1.0.1
 PyPDF2==3.0.1
-python-docx==1.1.2 
+python-docx==1.1.2
+supabase==2.3.1 
