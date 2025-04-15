@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS questions (
     sample_answers_textbox TEXT,
     is_sample_answer_textbox BOOLEAN DEFAULT FALSE,
     instructions TEXT,
+    template_url TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     subject_id UUID REFERENCES subjects(id)
 ); 
+
