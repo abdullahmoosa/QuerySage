@@ -44,7 +44,7 @@ supabase_ref = db_url.split("reference%3D")[-1] if "reference%3D" in db_url else
 # Construct Supabase URL and key (these should ideally be in .env)
 SUPABASE_URL = f"https://{supabase_ref}.supabase.co"
 # For security, the anon key should be in .env, but we'll use a placeholder for now
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRtd2V0Z2VncWR4bmliczt3cnh5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MTU5NTI2MDAsImV4cCI6MjAzMTUyODYwMH0.placeholder")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 # Get the service role key if available (has admin privileges)
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
